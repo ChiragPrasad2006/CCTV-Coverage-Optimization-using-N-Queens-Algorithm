@@ -16,58 +16,37 @@ public class Main {
         MAX_COVERAGE, LEAST_CAMERAS, MAX_CAMERAS
     }
 
-    static class CameraType {
+    enum CameraType {
+        BULLET_90("Bullet 90deg", 90, new Color(0, 119, 182)),
+        DOME_180("Dome 180deg", 180, new Color(247, 127, 0)),
+        PTZ_360("PTZ 360deg", 360, new Color(217, 4, 41));
+
         final String name;
-        final int[][] directions;
-        final int defaultRange;
+        final int fov;
         final Color color;
 
-        CameraType(String name, int[][] directions, int defaultRange, Color color) {
+        CameraType(String name, int fov, Color color) {
             this.name = name;
-            this.directions = directions;
-            this.defaultRange = defaultRange;
+            this.fov = fov;
             this.color = color;
         }
 
         @Override
-        public String toString() {
-            return name;
-        }
+        public String toString() { return name; }
     }
 
-    static final CameraType[] CAMERA_TYPES = new CameraType[] {
-        new CameraType("360deg PTZ", new int[][] {
-            {1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}
-        }, 6, new Color(217, 4, 41)),
-        new CameraType("Dome 180deg", new int[][] {
-            {0,1},{1,1},{-1,1},{1,0},{-1,0}
-        }, 5, new Color(247, 127, 0)),
-        new CameraType("Bullet 90deg", new int[][] {
-            {0,1},{1,1},{-1,1}
-        }, 4, new Color(0, 119, 182))
-    };
-
     static class Cell {
-        final int r;
-        final int c;
-
-        Cell(int r, int c) {
-            this.r = r;
-            this.c = c;
-        }
-
+        final int r, c;
+        Cell(int r, int c) { this.r = r; this.c = c; }
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
-            if (!(o instanceof Cell)) return false;
+            if (o == null || getClass() != o.getClass()) return false;
             Cell cell = (Cell) o;
             return r == cell.r && c == cell.c;
         }
-
         @Override
-        public int hashCode() {
-            return Objects.hash(r, c);
-        }
+        public int hashCode() { return r * 31 + c; }
     }
 
     enum Direction {
@@ -154,20 +133,27 @@ public class Main {
                 }
             }
             
-            boolean prune(int idx, int selectedCount, int coveredCount, int M) {
+            boolean prune(int idx, int selectedCount, int coveredCount, int M, int[] maxRem) {
                 int remaining = M - idx;
                 int bestCam = this.bestCameras;
                 int bestCov = this.bestCovered;
                 
                 if (mode == Mode.MAX_CAMERAS) {
-                    return bestCam != -1 && selectedCount + remaining <= bestCam;
+                    if (bestCam != -1 && selectedCount + remaining < bestCam) return true;
+                    if (bestCam != -1 && selectedCount + remaining == bestCam) {
+                        if (coveredCount + maxRem[idx] <= bestCov) return true;
+                    }
+                    return false;
                 } else if (mode == Mode.LEAST_CAMERAS) {
-                    if (bestCov == totalTargets) {
-                        return coveredCount == totalTargets && bestCam != -1 && selectedCount >= bestCam;
+                    if (bestCov != -1) {
+                        if (coveredCount + maxRem[idx] < bestCov) return true;
+                        if (coveredCount + maxRem[idx] == bestCov && bestCam != -1 && selectedCount >= bestCam) return true;
                     }
                     return false;
                 } else {
-                    return bestCov == totalTargets;
+                    if (bestCov == totalTargets) return true;
+                    if (bestCov != -1 && coveredCount + maxRem[idx] <= bestCov) return true;
+                    return false;
                 }
             }
         }
@@ -181,13 +167,43 @@ public class Main {
             prepare();
         }
 
-        private int[] rotate(int r, int c, Direction dir) {
-            switch(dir) {
-                case N: return new int[]{-c, r};
-                case S: return new int[]{c, -r};
-                case W: return new int[]{-r, -c};
-                case E: default: return new int[]{r, c};
+        private boolean isWithinFOV(int r0, int c0, int r1, int c1, Direction dir, int fov) {
+            if (r0 == r1 && c0 == c1) return false;
+            double vr = r1 - r0;
+            double vc = c1 - c0;
+            double dot = dir.dr * vr + dir.dc * vc;
+            double mag = Math.sqrt(vr * vr + vc * vc);
+            if (mag == 0) return false;
+            double cosTheta = dot / mag;
+            if (cosTheta > 1.0) cosTheta = 1.0;
+            if (cosTheta < -1.0) cosTheta = -1.0;
+            double angleDeg = Math.toDegrees(Math.acos(cosTheta));
+            return angleDeg <= fov / 2.0 + 0.1;
+        }
+
+        private boolean hasLineOfSight(int r0, int c0, int r1, int c1, Set<Cell> walls) {
+            int dr = Math.abs(r1 - r0);
+            int dc = Math.abs(c1 - c0);
+            int stepR = r0 < r1 ? 1 : -1;
+            int stepC = c0 < c1 ? 1 : -1;
+            int err = dr - dc;
+
+            int currR = r0, currC = c0;
+            while (true) {
+                if (currR == r1 && currC == c1) break;
+                if ((currR != r0 || currC != c0) && walls.contains(new Cell(currR, currC))) return false;
+                
+                int e2 = 2 * err;
+                if (e2 > -dc) {
+                    err -= dc;
+                    currR += stepR;
+                }
+                if (e2 < dr) {
+                    err += dr;
+                    currC += stepC;
+                }
             }
+            return true;
         }
 
         private void prepare() {
@@ -236,58 +252,38 @@ public class Main {
                 for (Direction dir : Direction.values()) {
                     if (dir != mp.dir) {
                         MountPoint confMp = new MountPoint(mp.cell, dir);
-                        if (mountSet.contains(confMp)) {
-                            md.conflicts.add(confMp);
+                        if (mountSet.contains(confMp)) md.conflicts.add(confMp);
+                    }
+                }
+                
+                for (Cell target : targetSet) {
+                    double dist = Math.sqrt(Math.pow(target.r - mp.cell.r, 2) + Math.pow(target.c - mp.cell.c, 2));
+                    if (dist <= range && dist > 0) {
+                        if (isWithinFOV(mp.cell.r, mp.cell.c, target.r, target.c, mp.dir, type.fov)) {
+                            if (hasLineOfSight(mp.cell.r, mp.cell.c, target.r, target.c, wallSet)) {
+                                md.covered.add(target);
+                            }
                         }
                     }
                 }
                 
-                for (int[] d : type.directions) {
-                    int[] rot = rotate(d[0], d[1], mp.dir);
-                    
-                    int rr = mp.cell.r + rot[0];
-                    int cc = mp.cell.c + rot[1];
-                    int steps = 0;
-                    while (rr >= 0 && rr < n && cc >= 0 && cc < n && steps < range) {
-                        Cell hit = new Cell(rr, cc);
-                        if (wallSet.contains(hit)) break;
-                        if (targetSet.contains(hit)) md.covered.add(hit);
-                        rr += rot[0];
-                        cc += rot[1];
-                        steps++;
-                    }
-                    
-                    rr = mp.cell.r + rot[0];
-                    cc = mp.cell.c + rot[1];
-                    while (rr >= 0 && rr < n && cc >= 0 && cc < n) {
-                        Cell hit = new Cell(rr, cc);
-                        if (wallSet.contains(hit)) {
-                            for (Direction dir : Direction.values()) {
-                                MountPoint confMp = new MountPoint(hit, dir);
-                                if (mountSet.contains(confMp)) {
-                                    md.conflicts.add(confMp);
-                                }
-                            }
-                            break;
+                for (MountPoint otherMp : mountCells) {
+                    if (otherMp.cell.equals(mp.cell)) continue;
+                    if (isWithinFOV(mp.cell.r, mp.cell.c, otherMp.cell.r, otherMp.cell.c, mp.dir, type.fov)) {
+                        if (hasLineOfSight(mp.cell.r, mp.cell.c, otherMp.cell.r, otherMp.cell.c, wallSet)) {
+                            md.conflicts.add(otherMp);
                         }
-                        rr += rot[0];
-                        cc += rot[1];
                     }
                 }
                 mounts.add(md);
             }
-            
             mounts.sort((a, b) -> Integer.compare(b.covered.size(), a.covered.size()));
-            
             mountCells.clear();
             for (MountData md : mounts) mountCells.add(md.mp);
-            
             Map<MountPoint, Integer> mountToId = new HashMap<>();
             for (int i = 0; i < totalMounts; i++) mountToId.put(mountCells.get(i), i);
-            
             coverages = new int[totalMounts][];
             conflicts = new int[totalMounts][];
-            
             for (int i = 0; i < totalMounts; i++) {
                 MountData md = mounts.get(i);
                 coverages[i] = md.covered.stream().mapToInt(targetToId::get).toArray();
@@ -300,44 +296,32 @@ public class Main {
             int M = totalMounts;
             int T = totalTargets;
             SharedState shared = new SharedState(mode, T, M);
-            
             if (M > 0) {
+                int[] maxRem = new int[M + 1];
+                Set<Integer> union = new HashSet<>();
+                for (int i = M - 1; i >= 0; i--) {
+                    for (int cId : coverages[i]) union.add(cId);
+                    maxRem[i] = union.size();
+                }
                 int cores = Runtime.getRuntime().availableProcessors();
                 ExecutorService executor = Executors.newFixedThreadPool(cores);
                 List<Callable<Void>> tasks = new ArrayList<>();
-                
-                int depthLimit = Math.min(M, 10);
-                generateTasks(0, new boolean[M], new int[T], new int[M], 0, 0, depthLimit, tasks, shared);
-                
-                try {
-                    executor.invokeAll(tasks);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
+                generateTasks(0, new boolean[M], new int[T], new int[M], 0, 0, Math.min(M, 10), tasks, shared, maxRem);
+                try { executor.invokeAll(tasks); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
                 executor.shutdown();
             }
-
             double seconds = (System.nanoTime() - start) / 1_000_000_000.0;
-
             SolveResult res = new SolveResult();
             res.cameras = new HashSet<>();
             res.covered = new HashSet<>();
-            
             if (shared.bestSelected != null) {
                 for (int i = 0; i < M; i++) {
                     if (shared.bestSelected[i]) {
                         res.cameras.add(mountCells.get(i));
-                    }
-                }
-                for (int i = 0; i < M; i++) {
-                    if (shared.bestSelected[i]) {
-                        for (int cId : coverages[i]) {
-                            res.covered.add(targetCells.get(cId));
-                        }
+                        for (int cId : coverages[i]) res.covered.add(targetCells.get(cId));
                     }
                 }
             }
-            
             res.totalFree = T;
             res.coveragePct = T == 0 ? 0.0 : (res.covered.size() * 100.0 / T);
             res.coveredArea = res.covered.size() * CELL_AREA_M2;
@@ -347,99 +331,52 @@ public class Main {
             return res;
         }
 
-        private void generateTasks(int idx, boolean[] selected, int[] coverCount, int[] unsafeCount, int selectedCount, int coveredCount, int depthLimit, List<Callable<Void>> tasks, SharedState shared) {
+        private void generateTasks(int idx, boolean[] selected, int[] coverCount, int[] unsafeCount, int selectedCount, int coveredCount, int depthLimit, List<Callable<Void>> tasks, SharedState shared, int[] maxRem) {
+            if (shared.prune(idx, selectedCount, coveredCount, totalMounts, maxRem)) return;
+            if (coveredCount == shared.totalTargets) { shared.update(selectedCount, coveredCount, selected); if (shared.mode != Mode.MAX_CAMERAS) return; }
             if (idx == depthLimit) {
-                boolean[] taskSelected = selected.clone();
-                int[] taskCoverCount = coverCount.clone();
-                int[] taskUnsafeCount = unsafeCount.clone();
-                tasks.add(new SolverTask(idx, taskSelected, taskCoverCount, taskUnsafeCount, selectedCount, coveredCount, shared));
+                tasks.add(new SolverTask(idx, selected.clone(), coverCount.clone(), unsafeCount.clone(), selectedCount, coveredCount, shared, maxRem));
                 return;
             }
-            
             if (unsafeCount[idx] == 0) {
                 selected[idx] = true;
                 int newCovered = coveredCount;
-                for (int cId : coverages[idx]) {
-                    if (coverCount[cId]++ == 0) newCovered++;
-                }
-                for (int cId : conflicts[idx]) {
-                    unsafeCount[cId]++;
-                }
-                
-                generateTasks(idx + 1, selected, coverCount, unsafeCount, selectedCount + 1, newCovered, depthLimit, tasks, shared);
-                
+                for (int cId : coverages[idx]) if (coverCount[cId]++ == 0) newCovered++;
+                for (int cId : conflicts[idx]) unsafeCount[cId]++;
+                generateTasks(idx + 1, selected, coverCount, unsafeCount, selectedCount + 1, newCovered, depthLimit, tasks, shared, maxRem);
                 selected[idx] = false;
-                for (int cId : coverages[idx]) {
-                    coverCount[cId]--;
-                }
-                for (int cId : conflicts[idx]) {
-                    unsafeCount[cId]--;
-                }
+                for (int cId : coverages[idx]) coverCount[cId]--;
+                for (int cId : conflicts[idx]) unsafeCount[cId]--;
             }
-            
-            generateTasks(idx + 1, selected, coverCount, unsafeCount, selectedCount, coveredCount, depthLimit, tasks, shared);
+            generateTasks(idx + 1, selected, coverCount, unsafeCount, selectedCount, coveredCount, depthLimit, tasks, shared, maxRem);
         }
         
         class SolverTask implements Callable<Void> {
-            int startIdx;
+            int startIdx, selectedCount, coveredCount, M;
             boolean[] selected;
-            int[] coverCount;
-            int[] unsafeCount;
-            int selectedCount;
-            int coveredCount;
+            int[] coverCount, unsafeCount, maxRem;
             SharedState shared;
             long states = 0;
-            int M;
-            
-            SolverTask(int startIdx, boolean[] selected, int[] coverCount, int[] unsafeCount, int selectedCount, int coveredCount, SharedState shared) {
-                this.startIdx = startIdx;
-                this.selected = selected;
-                this.coverCount = coverCount;
-                this.unsafeCount = unsafeCount;
-                this.selectedCount = selectedCount;
-                this.coveredCount = coveredCount;
-                this.shared = shared;
-                this.M = selected.length;
+            SolverTask(int idx, boolean[] sel, int[] cc, int[] uc, int sc, int cv, SharedState sh, int[] mr) {
+                startIdx = idx; selected = sel; coverCount = cc; unsafeCount = uc; selectedCount = sc; coveredCount = cv; shared = sh; maxRem = mr; M = sel.length;
             }
-            
-            @Override
-            public Void call() {
-                backtrack(startIdx);
-                shared.totalStates.addAndGet(states);
-                return null;
-            }
-            
+            public Void call() { backtrack(startIdx); shared.totalStates.addAndGet(states); return null; }
             void backtrack(int idx) {
                 states++;
-                if (shared.prune(idx, selectedCount, coveredCount, M)) return;
-                
-                if (idx == M) {
-                    shared.update(selectedCount, coveredCount, selected);
-                    return;
-                }
-                
+                if (shared.prune(idx, selectedCount, coveredCount, M, maxRem)) return;
+                if (coveredCount == shared.totalTargets) { shared.update(selectedCount, coveredCount, selected); if (shared.mode != Mode.MAX_CAMERAS) return; }
+                if (idx == M) { shared.update(selectedCount, coveredCount, selected); return; }
                 if (unsafeCount[idx] == 0) {
                     selected[idx] = true;
                     int prevCovered = coveredCount;
-                    for (int cId : coverages[idx]) {
-                        if (coverCount[cId]++ == 0) coveredCount++;
-                    }
-                    for (int cId : conflicts[idx]) {
-                        unsafeCount[cId]++;
-                    }
-                    
+                    for (int cId : coverages[idx]) if (coverCount[cId]++ == 0) coveredCount++;
+                    for (int cId : conflicts[idx]) unsafeCount[cId]++;
                     backtrack(idx + 1);
-                    
                     selected[idx] = false;
                     coveredCount = prevCovered;
-                    for (int cId : coverages[idx]) {
-                        coverCount[cId]--;
-                    }
-                    for (int cId : conflicts[idx]) {
-                        unsafeCount[cId]--;
-                    }
+                    for (int cId : coverages[idx]) coverCount[cId]--;
+                    for (int cId : conflicts[idx]) unsafeCount[cId]--;
                 }
-                
                 backtrack(idx + 1);
             }
         }
@@ -450,96 +387,43 @@ public class Main {
         Set<MountPoint> cameras = new HashSet<>();
         Set<Cell> covered = new HashSet<>();
         int tileSize = 20;
-        CameraType cameraType = CAMERA_TYPES[0];
+        CameraType cameraType = CameraType.values()[0];
 
         GridPanel() {
             addMouseListener(new MouseAdapter() {
                 @Override
                 public void mouseClicked(MouseEvent e) {
                     if (grid == null) return;
-                    int c = e.getX() / tileSize;
-                    int r = e.getY() / tileSize;
+                    int c = e.getX() / tileSize, r = e.getY() / tileSize;
                     if (r >= 0 && c >= 0 && r < grid.length && c < grid.length) {
                         grid[r][c] = (grid[r][c] == FREE) ? WALL : FREE;
-                        cameras.clear();
-                        covered.clear();
-                        repaint();
+                        cameras.clear(); covered.clear(); repaint();
                     }
                 }
             });
         }
-
-        void setGrid(int[][] grid) {
-            this.grid = grid;
-            cameras.clear();
-            covered.clear();
-            revalidate();
-            repaint();
-        }
-
-        void setTileSize(int tileSize) {
-            this.tileSize = Math.max(8, tileSize);
-            revalidate();
-            repaint();
-        }
-
-        void setSolution(Set<MountPoint> cameras, Set<Cell> covered, CameraType type) {
-            this.cameras = cameras;
-            this.covered = covered;
-            this.cameraType = type;
-            repaint();
-        }
-
-        @Override
-        public Dimension getPreferredSize() {
-            int n = grid == null ? 10 : grid.length;
-            return new Dimension(n * tileSize, n * tileSize);
-        }
-
-        @Override
-        protected void paintComponent(Graphics g) {
+        void setGrid(int[][] grid) { this.grid = grid; cameras.clear(); covered.clear(); revalidate(); repaint(); }
+        void setTileSize(int tileSize) { this.tileSize = Math.max(8, tileSize); revalidate(); repaint(); }
+        void setSolution(Set<MountPoint> cameras, Set<Cell> covered, CameraType type) { this.cameras = cameras; this.covered = covered; this.cameraType = type; repaint(); }
+        @Override public Dimension getPreferredSize() { int n = grid == null ? 10 : grid.length; return new Dimension(n * tileSize, n * tileSize); }
+        @Override protected void paintComponent(Graphics g) {
             super.paintComponent(g);
             if (grid == null) return;
             Graphics2D g2 = (Graphics2D) g;
             int n = grid.length;
-
             for (int r = 0; r < n; r++) {
                 for (int c = 0; c < n; c++) {
-                    int x = c * tileSize;
-                    int y = r * tileSize;
-
-                    Color fill = Color.WHITE;
-                    if (grid[r][c] == WALL) fill = new Color(158, 158, 158);
-                    else if (covered.contains(new Cell(r, c))) fill = new Color(200, 247, 197);
-
-                    g2.setColor(fill);
+                    int x = c * tileSize, y = r * tileSize;
+                    g2.setColor(grid[r][c] == WALL ? Color.GRAY : (covered.contains(new Cell(r, c)) ? new Color(200, 247, 197) : Color.WHITE));
                     g2.fillRect(x, y, tileSize, tileSize);
-                    g2.setColor(new Color(85, 85, 85));
                     g2.drawRect(x, y, tileSize, tileSize);
-
                     if (grid[r][c] == WALL) {
-                        g2.setColor(Color.BLACK);
-                        g2.drawString("X", x + tileSize / 2 - 3, y + tileSize / 2 + 4);
+                        g2.setColor(Color.BLACK); g2.drawString("X", x + 5, y + 15);
                         for (Direction dir : Direction.values()) {
-                            MountPoint mp = new MountPoint(new Cell(r, c), dir);
-                            if (cameras.contains(mp)) {
+                            if (cameras.contains(new MountPoint(new Cell(r, c), dir))) {
                                 g2.setColor(cameraType.color);
-                                int rSize = Math.max(4, tileSize / 2);
-                                int cx = x + tileSize / 2;
-                                int cy = y + tileSize / 2;
-                                int shift = tileSize / 3;
-                                
-                                if (dir == Direction.N) cy -= shift;
-                                else if (dir == Direction.S) cy += shift;
-                                else if (dir == Direction.E) cx += shift;
-                                else if (dir == Direction.W) cx -= shift;
-                                
-                                g2.fillOval(cx - rSize/2, cy - rSize/2, rSize, rSize);
-                                g2.setColor(Color.WHITE);
-                                if (dir == Direction.N) g2.drawLine(cx, cy, cx, cy - rSize/2);
-                                else if (dir == Direction.S) g2.drawLine(cx, cy, cx, cy + rSize/2);
-                                else if (dir == Direction.E) g2.drawLine(cx, cy, cx + rSize/2, cy);
-                                else if (dir == Direction.W) g2.drawLine(cx, cy, cx - rSize/2, cy);
+                                int cx = x + tileSize / 2, cy = y + tileSize / 2;
+                                g2.fillOval(cx - 3, cy - 3, 6, 6);
                             }
                         }
                     }
@@ -554,8 +438,8 @@ public class Main {
         private final JSpinner nSpinner = new JSpinner(new SpinnerNumberModel(12, 4, 40, 1));
         private final JSpinner tileSpinner = new JSpinner(new SpinnerNumberModel(20, 8, 40, 1));
         private final JComboBox<Mode> modeBox = new JComboBox<>(Mode.values());
-        private final JComboBox<CameraType> typeBox = new JComboBox<>(CAMERA_TYPES);
-        private final JSpinner rangeSpinner = new JSpinner(new SpinnerNumberModel(CAMERA_TYPES[0].defaultRange, 1, 20, 1));
+        private final JComboBox<CameraType> typeBox = new JComboBox<>(CameraType.values());
+        private final JSpinner rangeSpinner = new JSpinner(new SpinnerNumberModel(6, 1, 20, 1));
 
         private final JButton createBtn = new JButton("Create Grid");
         private final JButton clearBtn = new JButton("Clear Obstacles");
@@ -607,18 +491,36 @@ public class Main {
             clearBtn.addActionListener(e -> clearObstacles());
             solveBtn.addActionListener(e -> solve());
 
-            typeBox.addActionListener(e -> {
-                CameraType selected = (CameraType) typeBox.getSelectedItem();
-                if (selected != null) rangeSpinner.setValue(selected.defaultRange);
-            });
-
             tileSpinner.addChangeListener(e -> {
                 gridPanel.setTileSize((Integer) tileSpinner.getValue());
             });
 
-            createGrid();
+            loadDefaultLayout();
+            
             setSize(1200, 800);
             setLocationRelativeTo(null);
+        }
+
+        private void loadDefaultLayout() {
+            int n = (Integer) nSpinner.getValue();
+            grid = new int[n][n];
+            for (int r = 0; r < n; r++) {
+                for (int c = 0; c < n; c++) {
+                    if (r == 0 || r == n - 1 || c == 0 || c == n - 1) {
+                        grid[r][c] = WALL;
+                    }
+                }
+            }
+            int r = n / 2;
+            for (int c = 3; c < n - 3; c++) {
+                grid[r][c] = WALL;
+            }
+            for (int r2 = 3; r2 < n - 3; r2++) {
+                grid[r2][n / 2] = WALL;
+            }
+            gridPanel.setGrid(grid);
+            gridPanel.setTileSize((Integer) tileSpinner.getValue());
+            status.setText("Loaded default layout.");
         }
 
         private void createGrid() {
