@@ -6,7 +6,10 @@ This is a Java Swing implementation of Smart CCTV coverage optimization using N-
 
 - 1 grid cell = 1 square meter (1 m^2)
 - `X`/gray cells = obstacles (walls)
+- Cameras are mounted on wall/obstacle cells only
+- Camera arrows show the exact facing/tilt direction into the free space
 - Cameras cannot interfere in direct line-of-sight (obstacle-aware)
+- Neighboring wall-mounted cameras are treated as conflicts, so cameras do not bunch up side by side
 - Coverage rays stop at walls
 
 ## Camera Types
@@ -21,8 +24,9 @@ Range is configurable in meters (`1 meter = 1 cell`).
 
 - Java Swing GUI
 - Click to add/remove obstacles
-- `max_coverage` and `max_cameras` modes
-- Coverage %, covered area, blind spots, runtime, explored states
+- `MAX_COVERAGE`, `LEAST_CAMERAS`, and `MAX_CAMERAS` modes
+- In `LEAST_CAMERAS`, the solver maximizes coverage, then uses fewer cameras, then prefers lower overlap
+- Coverage %, covered area, overlap cells, blind spots, runtime, explored states
 - Larger maps supported:
   - Grid size up to `40 x 40`
   - Tile pixel size adjustable (`8px` to `40px`)

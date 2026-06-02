@@ -82,6 +82,7 @@ public class Main {
         double coveragePct;
         int coveredArea;
         int freeArea;
+        int overlapCells;
         long states;
         double seconds;
     }
@@ -103,6 +104,7 @@ public class Main {
         static class SharedState {
             volatile int bestCameras = -1;
             volatile int bestCovered = -1;
+            volatile int bestOverlap = Integer.MAX_VALUE;
             boolean[] bestSelected;
             AtomicLong totalStates = new AtomicLong();
             final Mode mode;
@@ -114,7 +116,7 @@ public class Main {
                 this.bestSelected = new boolean[M];
             }
             
-            synchronized void update(int selectedCount, int coveredCount, boolean[] selected) {
+            synchronized void update(int selectedCount, int coveredCount, int overlapCount, boolean[] selected) {
                 boolean better = false;
                 if (mode == Mode.MAX_CAMERAS) {
                     if (bestCameras == -1 || selectedCount > bestCameras) better = true;
@@ -122,6 +124,7 @@ public class Main {
                 } else if (mode == Mode.LEAST_CAMERAS) {
                     if (bestCovered == -1 || coveredCount > bestCovered) better = true;
                     else if (coveredCount == bestCovered && (bestCameras == -1 || selectedCount < bestCameras)) better = true;
+                    else if (coveredCount == bestCovered && selectedCount == bestCameras && overlapCount < bestOverlap) better = true;
                 } else {
                     if (bestCovered == -1 || coveredCount > bestCovered) better = true;
                 }
@@ -129,6 +132,7 @@ public class Main {
                 if (better) {
                     bestCameras = selectedCount;
                     bestCovered = coveredCount;
+                    bestOverlap = overlapCount;
                     System.arraycopy(selected, 0, bestSelected, 0, selected.length);
                 }
             }
@@ -147,7 +151,7 @@ public class Main {
                 } else if (mode == Mode.LEAST_CAMERAS) {
                     if (bestCov != -1) {
                         if (coveredCount + maxRem[idx] < bestCov) return true;
-                        if (coveredCount + maxRem[idx] == bestCov && bestCam != -1 && selectedCount >= bestCam) return true;
+                        if (coveredCount + maxRem[idx] == bestCov && bestCam != -1 && selectedCount > bestCam) return true;
                     }
                     return false;
                 } else {
@@ -255,6 +259,15 @@ public class Main {
                         if (mountSet.contains(confMp)) md.conflicts.add(confMp);
                     }
                 }
+
+                for (MountPoint otherMp : mountCells) {
+                    if (otherMp.equals(mp)) continue;
+                    int rowGap = Math.abs(otherMp.cell.r - mp.cell.r);
+                    int colGap = Math.abs(otherMp.cell.c - mp.cell.c);
+                    if (Math.max(rowGap, colGap) <= 1) {
+                        md.conflicts.add(otherMp);
+                    }
+                }
                 
                 for (Cell target : targetSet) {
                     double dist = Math.sqrt(Math.pow(target.r - mp.cell.r, 2) + Math.pow(target.c - mp.cell.c, 2));
@@ -306,7 +319,7 @@ public class Main {
                 int cores = Runtime.getRuntime().availableProcessors();
                 ExecutorService executor = Executors.newFixedThreadPool(cores);
                 List<Callable<Void>> tasks = new ArrayList<>();
-                generateTasks(0, new boolean[M], new int[T], new int[M], 0, 0, Math.min(M, 10), tasks, shared, maxRem);
+                generateTasks(0, new boolean[M], new int[T], new int[M], 0, 0, 0, Math.min(M, 10), tasks, shared, maxRem);
                 try { executor.invokeAll(tasks); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
                 executor.shutdown();
             }
@@ -326,54 +339,64 @@ public class Main {
             res.coveragePct = T == 0 ? 0.0 : (res.covered.size() * 100.0 / T);
             res.coveredArea = res.covered.size() * CELL_AREA_M2;
             res.freeArea = T * CELL_AREA_M2;
+            res.overlapCells = shared.bestOverlap == Integer.MAX_VALUE ? 0 : shared.bestOverlap;
             res.states = shared.totalStates.get();
             res.seconds = seconds;
             return res;
         }
 
-        private void generateTasks(int idx, boolean[] selected, int[] coverCount, int[] unsafeCount, int selectedCount, int coveredCount, int depthLimit, List<Callable<Void>> tasks, SharedState shared, int[] maxRem) {
+        private void generateTasks(int idx, boolean[] selected, int[] coverCount, int[] unsafeCount, int selectedCount, int coveredCount, int overlapCount, int depthLimit, List<Callable<Void>> tasks, SharedState shared, int[] maxRem) {
             if (shared.prune(idx, selectedCount, coveredCount, totalMounts, maxRem)) return;
-            if (coveredCount == shared.totalTargets) { shared.update(selectedCount, coveredCount, selected); if (shared.mode != Mode.MAX_CAMERAS) return; }
+            if (coveredCount == shared.totalTargets) { shared.update(selectedCount, coveredCount, overlapCount, selected); if (shared.mode != Mode.MAX_CAMERAS) return; }
             if (idx == depthLimit) {
-                tasks.add(new SolverTask(idx, selected.clone(), coverCount.clone(), unsafeCount.clone(), selectedCount, coveredCount, shared, maxRem));
+                tasks.add(new SolverTask(idx, selected.clone(), coverCount.clone(), unsafeCount.clone(), selectedCount, coveredCount, overlapCount, shared, maxRem));
                 return;
             }
             if (unsafeCount[idx] == 0) {
                 selected[idx] = true;
                 int newCovered = coveredCount;
-                for (int cId : coverages[idx]) if (coverCount[cId]++ == 0) newCovered++;
+                int newOverlap = overlapCount;
+                for (int cId : coverages[idx]) {
+                    if (coverCount[cId]++ == 0) newCovered++;
+                    else newOverlap++;
+                }
                 for (int cId : conflicts[idx]) unsafeCount[cId]++;
-                generateTasks(idx + 1, selected, coverCount, unsafeCount, selectedCount + 1, newCovered, depthLimit, tasks, shared, maxRem);
+                generateTasks(idx + 1, selected, coverCount, unsafeCount, selectedCount + 1, newCovered, newOverlap, depthLimit, tasks, shared, maxRem);
                 selected[idx] = false;
                 for (int cId : coverages[idx]) coverCount[cId]--;
                 for (int cId : conflicts[idx]) unsafeCount[cId]--;
             }
-            generateTasks(idx + 1, selected, coverCount, unsafeCount, selectedCount, coveredCount, depthLimit, tasks, shared, maxRem);
+            generateTasks(idx + 1, selected, coverCount, unsafeCount, selectedCount, coveredCount, overlapCount, depthLimit, tasks, shared, maxRem);
         }
         
         class SolverTask implements Callable<Void> {
-            int startIdx, selectedCount, coveredCount, M;
+            int startIdx, selectedCount, coveredCount, overlapCount, M;
             boolean[] selected;
             int[] coverCount, unsafeCount, maxRem;
             SharedState shared;
             long states = 0;
-            SolverTask(int idx, boolean[] sel, int[] cc, int[] uc, int sc, int cv, SharedState sh, int[] mr) {
-                startIdx = idx; selected = sel; coverCount = cc; unsafeCount = uc; selectedCount = sc; coveredCount = cv; shared = sh; maxRem = mr; M = sel.length;
+            SolverTask(int idx, boolean[] sel, int[] cc, int[] uc, int sc, int cv, int ov, SharedState sh, int[] mr) {
+                startIdx = idx; selected = sel; coverCount = cc; unsafeCount = uc; selectedCount = sc; coveredCount = cv; overlapCount = ov; shared = sh; maxRem = mr; M = sel.length;
             }
             public Void call() { backtrack(startIdx); shared.totalStates.addAndGet(states); return null; }
             void backtrack(int idx) {
                 states++;
                 if (shared.prune(idx, selectedCount, coveredCount, M, maxRem)) return;
-                if (coveredCount == shared.totalTargets) { shared.update(selectedCount, coveredCount, selected); if (shared.mode != Mode.MAX_CAMERAS) return; }
-                if (idx == M) { shared.update(selectedCount, coveredCount, selected); return; }
+                if (coveredCount == shared.totalTargets) { shared.update(selectedCount, coveredCount, overlapCount, selected); if (shared.mode != Mode.MAX_CAMERAS) return; }
+                if (idx == M) { shared.update(selectedCount, coveredCount, overlapCount, selected); return; }
                 if (unsafeCount[idx] == 0) {
                     selected[idx] = true;
                     int prevCovered = coveredCount;
-                    for (int cId : coverages[idx]) if (coverCount[cId]++ == 0) coveredCount++;
+                    int prevOverlap = overlapCount;
+                    for (int cId : coverages[idx]) {
+                        if (coverCount[cId]++ == 0) coveredCount++;
+                        else overlapCount++;
+                    }
                     for (int cId : conflicts[idx]) unsafeCount[cId]++;
                     backtrack(idx + 1);
                     selected[idx] = false;
                     coveredCount = prevCovered;
+                    overlapCount = prevOverlap;
                     for (int cId : coverages[idx]) coverCount[cId]--;
                     for (int cId : conflicts[idx]) unsafeCount[cId]--;
                 }
@@ -406,28 +429,62 @@ public class Main {
         void setTileSize(int tileSize) { this.tileSize = Math.max(8, tileSize); revalidate(); repaint(); }
         void setSolution(Set<MountPoint> cameras, Set<Cell> covered, CameraType type) { this.cameras = cameras; this.covered = covered; this.cameraType = type; repaint(); }
         @Override public Dimension getPreferredSize() { int n = grid == null ? 10 : grid.length; return new Dimension(n * tileSize, n * tileSize); }
+        private void drawMountedCamera(Graphics2D g2, int x, int y, Direction dir) {
+            int centerX = x + tileSize / 2;
+            int centerY = y + tileSize / 2;
+            int edgePadding = Math.max(2, tileSize / 8);
+            int mountX = centerX + dir.dc * (tileSize / 2 - edgePadding);
+            int mountY = centerY + dir.dr * (tileSize / 2 - edgePadding);
+            int arrowLen = Math.max(7, tileSize / 2);
+            int tipX = mountX + dir.dc * arrowLen;
+            int tipY = mountY + dir.dr * arrowLen;
+
+            g2.setStroke(new BasicStroke(Math.max(2, tileSize / 8), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            g2.setColor(cameraType.color);
+            g2.fillOval(mountX - 4, mountY - 4, 8, 8);
+            g2.drawLine(mountX, mountY, tipX, tipY);
+
+            int sideX = -dir.dr;
+            int sideY = dir.dc;
+            int wing = Math.max(4, tileSize / 5);
+            int backX = tipX - dir.dc * wing;
+            int backY = tipY - dir.dr * wing;
+            Polygon head = new Polygon();
+            head.addPoint(tipX, tipY);
+            head.addPoint(backX + sideX * wing / 2, backY + sideY * wing / 2);
+            head.addPoint(backX - sideX * wing / 2, backY - sideY * wing / 2);
+            g2.fillPolygon(head);
+
+            g2.setStroke(new BasicStroke(1));
+        }
+
         @Override protected void paintComponent(Graphics g) {
             super.paintComponent(g);
             if (grid == null) return;
             Graphics2D g2 = (Graphics2D) g;
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             int n = grid.length;
             for (int r = 0; r < n; r++) {
                 for (int c = 0; c < n; c++) {
                     int x = c * tileSize, y = r * tileSize;
-                    g2.setColor(grid[r][c] == WALL ? Color.GRAY : (covered.contains(new Cell(r, c)) ? new Color(200, 247, 197) : Color.WHITE));
+                    g2.setColor(grid[r][c] == WALL ? new Color(140, 140, 140) : (covered.contains(new Cell(r, c)) ? new Color(188, 245, 184) : Color.WHITE));
                     g2.fillRect(x, y, tileSize, tileSize);
+                    g2.setColor(new Color(70, 70, 70));
+                    g2.setStroke(new BasicStroke(1.2f));
                     g2.drawRect(x, y, tileSize, tileSize);
                     if (grid[r][c] == WALL) {
-                        g2.setColor(Color.BLACK); g2.drawString("X", x + 5, y + 15);
-                        for (Direction dir : Direction.values()) {
-                            if (cameras.contains(new MountPoint(new Cell(r, c), dir))) {
-                                g2.setColor(cameraType.color);
-                                int cx = x + tileSize / 2, cy = y + tileSize / 2;
-                                g2.fillOval(cx - 3, cy - 3, 6, 6);
-                            }
+                        if (tileSize >= 14) {
+                            g2.setColor(Color.BLACK); g2.drawString("X", x + 5, y + 15);
                         }
                     }
                 }
+            }
+
+            // Draw cameras after cells so arrows are not covered by neighboring tiles.
+            for (MountPoint camera : cameras) {
+                int x = camera.cell.c * tileSize;
+                int y = camera.cell.r * tileSize;
+                drawMountedCamera(g2, x, y, camera.dir);
             }
         }
     }
@@ -479,7 +536,7 @@ public class Main {
             progressBar.setVisible(false);
 
             JPanel bottom = new JPanel(new BorderLayout());
-            bottom.add(new JLabel("Legend: White=Free(1m^2), Gray=Obstacle, Green=Covered, Dot=Camera"), BorderLayout.NORTH);
+            bottom.add(new JLabel("Legend: White=Free(1m^2), Gray=Wall/Obstacle, Green=Covered, Arrow=Wall-mounted camera facing direction"), BorderLayout.NORTH);
             
             JPanel statusPanel = new JPanel(new BorderLayout());
             statusPanel.add(status, BorderLayout.CENTER);
@@ -600,8 +657,8 @@ public class Main {
 
                         gridPanel.setSolution(res.cameras, res.covered, type);
                         status.setText(String.format(
-                            "Type=%s (%dm) | Mode=%s | Cameras=%d | Coverage=%.2f%% (%dm^2/%dm^2) | Blind=%d (%dm^2) | States=%d | Time=%.4fs",
-                            type.name, range, mode, res.cameras.size(), res.coveragePct, res.coveredArea, res.freeArea, blindSpots, blindArea, res.states, res.seconds
+                            "Type=%s (%dm) | Mode=%s | Cameras=%d | Coverage=%.2f%% (%dm^2/%dm^2) | Overlap=%d cells | Blind=%d (%dm^2) | States=%d | Time=%.4fs",
+                            type.name, range, mode, res.cameras.size(), res.coveragePct, res.coveredArea, res.freeArea, res.overlapCells, blindSpots, blindArea, res.states, res.seconds
                         ));
                     } catch (Exception ex) {
                         status.setText("Error during solve: " + ex.getMessage());
